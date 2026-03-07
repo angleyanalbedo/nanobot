@@ -111,6 +111,7 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
+        self._pending_inputs: dict[str, asyncio.Future] = {}
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -152,6 +153,20 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
+    async def _ask_user(self, session_key: str, channel: str, chat_id: str, prompt: str) -> str:
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=channel, chat_id=chat_id, content=prompt
+        ))
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._pending_inputs[session_key] = future
+
+        try:
+            return await asyncio.wait_for(future, timeout=300)
+        finally:
+            self._pending_inputs.pop(session_key, None)
+
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
@@ -179,6 +194,9 @@ class AgentLoop:
 
     async def _run_agent_loop(
         self,
+        session_key: str,
+        channel: str,
+        chat_id: str,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
@@ -237,6 +255,21 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+                    if tool_call.name == "exec":
+                        prompt = (
+                            f"\n⚠️ WARNING: The AI wants to execute a shell command ⚠️\n"
+                            f"Arguments: {args_str}\n"
+                            f"Allow execution? [y/N]: "
+                        )
+                        choice = await self._ask_user(session_key, channel, chat_id, prompt)
+
+                        if choice.strip().lower() not in ['y', 'yes']:
+                            logger.info("User denied the execution of the command.")
+                            result = "Action cancelled: User denied permission to execute this command."
+                            messages = self.context.add_tool_result(
+                                messages, tool_call.id, tool_call.name, result
+                            )
+                            continue
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
@@ -279,6 +312,8 @@ class AgentLoop:
 
             if msg.content.strip().lower() == "/stop":
                 await self._handle_stop(msg)
+            elif msg.session_key in self._pending_inputs:
+                self._pending_inputs[msg.session_key].set_result(msg.content)
             else:
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
@@ -356,7 +391,7 @@ class AgentLoop:
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
+            final_content, _, all_msgs = await self._run_agent_loop(session.key,msg.channel,msg.chat_id,messages)
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
@@ -442,6 +477,9 @@ class AgentLoop:
             ))
 
         final_content, _, all_msgs = await self._run_agent_loop(
+            session.key,
+            msg.channel,
+            msg.chat_id,
             initial_messages, on_progress=on_progress or _bus_progress,
         )
 
