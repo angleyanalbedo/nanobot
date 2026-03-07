@@ -275,7 +275,7 @@ class AgentLoop:
                         prompt = (
                             f"⚠️ **WARNING: AI requests to execute a shell command** ⚠️\n\n"
                             f"**Arguments:**\n`{args_str}`\n\n"
-                            f"Reply with **'y'** or **'yes'** to allow execution. (Times out in 5 minutes)"
+                            f"Reply with **'y'** or **'yes'** to allow execution. (Times out in {self.exec_config.timeout} s)"
                         )
 
                         # Suspend and wait for user reply across the bus
