@@ -179,7 +179,7 @@ class AgentLoop:
             logger.warning(f"User confirmation timed out for session {session_key}")
             return "timeout"
         finally:
-            self._pending_inputs.pop(session_key, None)
+            await self._pending_inputs.pop(session_key, None)
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
@@ -272,7 +272,22 @@ class AgentLoop:
 
                     # === Interception logic for user confirmation BEGIN ===
                     if tool_call.name == "exec" and self.exec_config.require_confirmation:
-                        if session_key not in self._auto_approve_sessions:
+                        cmd = ""
+                        try:
+                            args_dict = tool_call.arguments if isinstance(tool_call.arguments, dict) else json.loads(
+                                tool_call.arguments)
+                            cmd = args_dict.get("command", "").strip()
+                        except Exception as e:
+                            logger.warning(f"Failed to parse exec arguments for whitelist check: {e}")
+
+                        safe_cmds = ("ls", "pwd", "whoami", "echo", "cat", "tree", "dir", "git status", "git log")
+
+                        is_whitelisted = any(cmd == sc or cmd.startswith(sc + " ") for sc in safe_cmds)
+
+                        if is_whitelisted:
+                            logger.info(f"Command whitelisted, executing silently: {cmd[:50]}")
+                        # 如果不在白名单内，且当前 session 尚未被授权“全部同意”
+                        elif session_key not in self._auto_approve_sessions:
                             prompt = (
                                 f"⚠️ **WARNING: AI requests to execute a shell command** ⚠️\n\n"
                                 f"**Arguments:**\n`{args_str}`\n\n"
