@@ -112,6 +112,7 @@ class AgentLoop:
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
         self._pending_inputs: dict[str, asyncio.Future] = {}
+        self._auto_approve_sessions: set[str] = set()
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -270,32 +271,38 @@ class AgentLoop:
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
 
                     # === Interception logic for user confirmation BEGIN ===
-                    # Only intercept if the tool is "exec" AND the config requires confirmation
                     if tool_call.name == "exec" and self.exec_config.require_confirmation:
-                        prompt = (
-                            f"⚠️ **WARNING: AI requests to execute a shell command** ⚠️\n\n"
-                            f"**Arguments:**\n`{args_str}`\n\n"
-                            f"Reply with **'y'** or **'yes'** to allow execution. (Times out in {self.exec_config.timeout} s)"
-                        )
-
-                        # Suspend and wait for user reply across the bus
-                        choice = await self._ask_user(session_key, channel, chat_id, prompt, timeout=self.exec_config.timeout)
-
-                        if choice == "timeout":
-                            result = "Action cancelled: User did not respond in time (timeout)."
-                            messages = self.context.add_tool_result(
-                                messages, tool_call.id, tool_call.name, result
+                        if session_key not in self._auto_approve_sessions:
+                            prompt = (
+                                f"⚠️ **WARNING: AI requests to execute a shell command** ⚠️\n\n"
+                                f"**Arguments:**\n`{args_str}`\n\n"
+                                f"Reply with:\n"
+                                f"- **'y'** to allow this execution\n"
+                                f"- **'n'** to deny\n"
+                                f"- **'a'** to allow this and ALL future commands in this session."
                             )
-                            continue
 
-                        if choice.strip().lower() not in ['y', 'yes']:
-                            logger.info("User denied the execution of the command.")
-                            result = "Action cancelled: User denied permission to execute this command."
-                            messages = self.context.add_tool_result(
-                                messages, tool_call.id, tool_call.name, result
-                            )
-                            continue
-                            # === Interception logic END ===
+                            choice = await self._ask_user(session_key, channel, chat_id, prompt, timeout=300)
+                            choice_clean = choice.strip().lower() if isinstance(choice, str) else ""
+
+                            if choice_clean == "timeout":
+                                result = "Action cancelled: User did not respond in time (timeout)."
+                                messages = self.context.add_tool_result(
+                                    messages, tool_call.id, tool_call.name, result
+                                )
+                                continue
+
+                            if choice_clean in ['a', 'all']:
+                                logger.info(f"User granted auto-approval for session {session_key}")
+                                self._auto_approve_sessions.add(session_key)
+                            elif choice_clean not in ['y', 'yes']:
+                                logger.info("User denied the execution of the command.")
+                                result = "Action cancelled: User denied permission to execute this command."
+                                messages = self.context.add_tool_result(
+                                    messages, tool_call.id, tool_call.name, result
+                                )
+                                continue
+                    # === Interception logic END ===
 
                     # Normal tool execution flow
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
@@ -459,6 +466,7 @@ class AgentLoop:
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
+            self._auto_approve_sessions.discard(session.key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
